@@ -62,9 +62,18 @@ CREATE TABLE IF NOT EXISTS config (
 -- Initialize round_robin_state with default row
 INSERT OR IGNORE INTO round_robin_state (id, last_key_id) VALUES (1, 0);
 
+-- Research 任务与密钥映射表
+CREATE TABLE IF NOT EXISTS research_tasks (
+  id TEXT PRIMARY KEY,
+  exa_key_id INTEGER NOT NULL,
+  created_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY (exa_key_id) REFERENCES exa_keys(id) ON DELETE CASCADE
+);
+
 -- Create indexes for better query performance
 CREATE INDEX IF NOT EXISTS idx_exa_keys_status ON exa_keys(status);
 CREATE INDEX IF NOT EXISTS idx_allowed_keys_key ON allowed_keys(key);
+CREATE INDEX IF NOT EXISTS idx_research_tasks_exa_key_id ON research_tasks(exa_key_id);
 `;
 
 // ============================================================================
@@ -2874,22 +2883,158 @@ async function proxyResearchCreate(request, env) {
     );
   }
 
-  return executeWithRetry(env, async (exaKey) => {
-    const response = await fetch('https://api.exa.ai/research/v1', {
-      method: 'POST',
+  // 使用特殊的执行逻辑，需要保存 task ID 与 key 的映射
+  return executeResearchCreate(env, body);
+}
+
+/**
+ * 执行 Research 创建请求，并保存任务与密钥的映射
+ * @param {Env} env - Environment bindings
+ * @param {Object} body - Request body
+ * @returns {Promise<Response>}
+ */
+async function executeResearchCreate(env, body) {
+  const maxRetries = 3;
+  let attempts = 0;
+  let lastResponse = null;
+  
+  while (attempts < maxRetries) {
+    const keyData = await getNextKey(env.DB);
+    
+    if (!keyData) {
+      await recordFailure(env.DB);
+      return jsonResponse(
+        { error: 'Service Unavailable', message: 'No API keys available' },
+        503
+      );
+    }
+    
+    try {
+      const response = await fetch('https://api.exa.ai/research/v1', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': keyData.key
+        },
+        body: JSON.stringify(body)
+      });
+      
+      const result = await processExaResponse(response);
+      
+      if (result.success) {
+        await recordSuccess(env.DB, keyData.id);
+        
+        // 解析响应获取 task ID 并保存映射
+        const responseBody = await result.response.text();
+        try {
+          const responseData = JSON.parse(responseBody);
+          // Exa API 返回的字段是 researchId
+          const taskId = responseData.researchId || responseData.id;
+          if (taskId) {
+            await saveResearchTaskMapping(env.DB, taskId, keyData.id);
+          }
+        } catch (e) {
+          console.error('Failed to parse research response:', e);
+        }
+        
+        return new Response(responseBody, {
+          status: result.response.status,
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key'
+          }
+        });
+      }
+      
+      lastResponse = result;
+      
+      if (result.keyExhausted) {
+        await markKeyStatus(env.DB, keyData.id, 'exhausted', 'Insufficient balance');
+      } else if (result.keyInvalid) {
+        await markKeyStatus(env.DB, keyData.id, 'invalid', 'Invalid API key');
+      }
+      
+      if (!result.shouldRetry) {
+        await recordFailure(env.DB);
+        return new Response(result.responseBody || '{"error":"Unknown error"}', {
+          status: result.response.status,
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*'
+          }
+        });
+      }
+      
+    } catch (error) {
+      console.error('Request error:', error);
+    }
+    
+    attempts++;
+  }
+  
+  await recordFailure(env.DB);
+  
+  if (lastResponse && lastResponse.responseBody) {
+    return new Response(lastResponse.responseBody, {
+      status: lastResponse.response.status,
       headers: {
         'Content-Type': 'application/json',
-        'x-api-key': exaKey
-      },
-      body: JSON.stringify(body)
+        'Access-Control-Allow-Origin': '*'
+      }
     });
+  }
+  
+  return jsonResponse(
+    { error: 'Service Unavailable', message: 'All retry attempts failed' },
+    503
+  );
+}
 
-    return processExaResponse(response);
-  });
+/**
+ * 保存 Research 任务与 Exa key 的映射
+ * @param {D1Database} db - D1 database instance
+ * @param {string} taskId - Research task ID
+ * @param {number} keyId - Exa key ID
+ * @returns {Promise<void>}
+ */
+async function saveResearchTaskMapping(db, taskId, keyId) {
+  try {
+    await db.prepare(
+      'INSERT OR REPLACE INTO research_tasks (id, exa_key_id) VALUES (?, ?)'
+    ).bind(taskId, keyId).run();
+  } catch (error) {
+    console.error('Failed to save research task mapping:', error);
+  }
+}
+
+/**
+ * 获取 Research 任务对应的 Exa key
+ * @param {D1Database} db - D1 database instance
+ * @param {string} taskId - Research task ID
+ * @returns {Promise<{id: number, key: string} | null>}
+ */
+async function getResearchTaskKey(db, taskId) {
+  try {
+    const result = await db.prepare(
+      `SELECT ek.id, ek.key FROM research_tasks rt
+       JOIN exa_keys ek ON rt.exa_key_id = ek.id
+       WHERE rt.id = ?`
+    ).bind(taskId).first();
+    
+    if (result) {
+      return { id: result.id, key: result.key };
+    }
+  } catch (error) {
+    console.error('Failed to get research task key:', error);
+  }
+  return null;
 }
 
 /**
  * 获取 Research 任务列表
+ * 从本地数据库获取所有已记录的任务，并聚合各个 key 下的任务详情
  * @param {Request} request
  * @param {Env} env
  * @returns {Promise<Response>}
@@ -2904,9 +3049,8 @@ async function proxyResearchList(request, env) {
   }
 
   const url = new URL(request.url);
-  const params = new URLSearchParams();
-
   const limit = url.searchParams.get('limit');
+  let limitNum = 20; // 默认返回 20 条
   if (limit !== null) {
     const n = Number(limit);
     if (!Number.isInteger(n) || n < 1 || n > 50) {
@@ -2915,28 +3059,57 @@ async function proxyResearchList(request, env) {
         400
       );
     }
-    params.set('limit', String(n));
+    limitNum = n;
   }
 
-  const cursor = url.searchParams.get('cursor');
-  if (cursor) {
-    params.set('cursor', cursor);
-  }
+  try {
+    // 从本地数据库获取所有任务及其对应的 key
+    const result = await env.DB.prepare(
+      `SELECT rt.id as task_id, ek.id as key_id, ek.key as exa_key
+       FROM research_tasks rt
+       JOIN exa_keys ek ON rt.exa_key_id = ek.id
+       ORDER BY rt.created_at DESC
+       LIMIT ?`
+    ).bind(limitNum).all();
 
-  const upstreamUrl = params.toString()
-    ? `https://api.exa.ai/research/v1?${params.toString()}`
-    : 'https://api.exa.ai/research/v1';
+    const tasks = result.results || [];
+    
+    if (tasks.length === 0) {
+      return jsonResponse({ data: [] });
+    }
 
-  return executeWithRetry(env, async (exaKey) => {
-    const response = await fetch(upstreamUrl, {
-      method: 'GET',
-      headers: {
-        'x-api-key': exaKey
+    // 并发请求每个任务的详情
+    const taskPromises = tasks.map(async (task) => {
+      try {
+        const response = await fetch(
+          `https://api.exa.ai/research/v1/${encodeURIComponent(task.task_id)}`,
+          {
+            method: 'GET',
+            headers: { 'x-api-key': task.exa_key }
+          }
+        );
+        
+        if (response.ok) {
+          return await response.json();
+        }
+        return null;
+      } catch (e) {
+        console.error(`Failed to fetch task ${task.task_id}:`, e);
+        return null;
       }
     });
 
-    return processExaResponse(response);
-  });
+    const taskResults = await Promise.all(taskPromises);
+    const validTasks = taskResults.filter(t => t !== null);
+
+    return jsonResponse({ data: validTasks });
+  } catch (error) {
+    console.error('Error listing research tasks:', error);
+    return jsonResponse(
+      { error: 'Internal Server Error', message: 'Failed to list research tasks' },
+      500
+    );
+  }
 }
 
 /**
@@ -2963,22 +3136,83 @@ async function proxyResearchGet(request, env, params) {
     );
   }
 
+  // 查找该任务对应的 key
+  const keyData = await getResearchTaskKey(env.DB, researchId);
+  
+  if (!keyData) {
+    // 如果找不到映射，可能是旧任务或者任务不存在，尝试用轮询的 key
+    return executeWithRetry(env, async (exaKey) => {
+      const url = new URL(request.url);
+      const queryString = url.searchParams.toString();
+      const upstreamUrl = queryString
+        ? `https://api.exa.ai/research/v1/${encodeURIComponent(researchId)}?${queryString}`
+        : `https://api.exa.ai/research/v1/${encodeURIComponent(researchId)}`;
+      
+      const response = await fetch(upstreamUrl, {
+        method: 'GET',
+        headers: {
+          'x-api-key': exaKey
+        }
+      });
+
+      return processExaResponse(response);
+    });
+  }
+
+  // 使用创建任务时的 key 来查询
   const url = new URL(request.url);
   const queryString = url.searchParams.toString();
   const upstreamUrl = queryString
     ? `https://api.exa.ai/research/v1/${encodeURIComponent(researchId)}?${queryString}`
     : `https://api.exa.ai/research/v1/${encodeURIComponent(researchId)}`;
 
-  return executeWithRetry(env, async (exaKey) => {
+  try {
     const response = await fetch(upstreamUrl, {
       method: 'GET',
       headers: {
-        'x-api-key': exaKey
+        'x-api-key': keyData.key
       }
     });
 
-    return processExaResponse(response);
-  });
+    const result = await processExaResponse(response);
+    
+    if (result.success) {
+      await recordSuccess(env.DB, keyData.id);
+      const responseBody = await result.response.text();
+      return new Response(responseBody, {
+        status: result.response.status,
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key'
+        }
+      });
+    }
+    
+    // 如果 key 失效，标记状态
+    if (result.keyExhausted) {
+      await markKeyStatus(env.DB, keyData.id, 'exhausted', 'Insufficient balance');
+    } else if (result.keyInvalid) {
+      await markKeyStatus(env.DB, keyData.id, 'invalid', 'Invalid API key');
+    }
+    
+    await recordFailure(env.DB);
+    return new Response(result.responseBody || '{"error":"Unknown error"}', {
+      status: result.response.status,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching research task:', error);
+    await recordFailure(env.DB);
+    return jsonResponse(
+      { error: 'Internal Server Error', message: 'Failed to fetch research task' },
+      500
+    );
+  }
 }
 
 /**
