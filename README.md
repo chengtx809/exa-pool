@@ -1,7 +1,7 @@
 # Exa Pool
-
-基于 Cloudflare Workers 的 Exa API 密钥负载均衡器，支持多密钥轮询、自动故障转移和可视化管理面板。
-
+## 项目简介
+### ✨基于 Cloudflare Workers 的 Exa API 密钥负载均衡器，支持多密钥轮询、自动故障转移和可视化管理面板。
+- ❤现可与[exa-pool-mcp](https://github.com/TullyMonster/exa-pool-mcp) 配合，封装为可供 AI 助手调用的MCP工具集
 <img width="1327" height="793" alt="image" src="https://github.com/user-attachments/assets/9743b3b5-f65e-4eda-b9d5-f07f3f5281fb" />
 
 ## 功能特性
